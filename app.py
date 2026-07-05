@@ -87,7 +87,7 @@ SIMILITUD_UMBRAL = 0.22
 # ─── FUENTES ──────────────────────────────────────────────────────────────────
 FUENTES_NAC = [
     {"id": "ole",           "nombre": "Olé",           "url": "https://www.ole.com.ar/",                             "color": "#00a846", "es_ole": True},
-    {"id": "espn",          "nombre": "ESPN AR",        "url": "https://www.espn.com.ar/",                            "color": "#cc0000"},
+    {"id": "espn",          "nombre": "ESPN AR",        "url": "https://www.espn.com.ar/",                            "color": "#cc0000", "es_espn": True},
     {"id": "tyc",           "nombre": "TyC Sports",     "url": "https://www.tycsports.com/",                          "color": "#1565c0"},
     {"id": "infobae",       "nombre": "Infobae",        "url": "https://www.infobae.com/deportes/",                   "color": "#b00020"},
     {"id": "lanacion",      "nombre": "La Nación",      "url": "https://www.lanacion.com.ar/deportes/",               "color": "#1565c0"},
@@ -119,6 +119,12 @@ FUENTES_INT = [
     {"id": "sportnews", "nombre": "Sporting News",    "url": "https://www.sportingnews.com/us/soccer",          "color": "#cc3300"},
     {"id": "lequipe",   "nombre": "L'Equipe",         "url": "https://www.lequipe.fr/Football/",                "color": "#f5c400"},
     {"id": "fifa",      "nombre": "FIFA (RSS)",       "url": "https://www.fifa.com/rss-feeds/index.html",       "color": "#326295"},
+
+    # ── Nuevos: inglés + especialistas de mercado (todos por RSS) ──
+    {"id": "guardian",   "nombre": "Guardian Fútbol",  "url": "https://www.theguardian.com/football/rss",        "color": "#052962", "es_rss": True},
+    {"id": "skysports",  "nombre": "Sky Sports",       "url": "https://www.skysports.com/rss/12040",             "color": "#0072c9", "es_rss": True},
+    {"id": "dimarzio",   "nombre": "Di Marzio",        "url": "https://www.gianlucadimarzio.com/it/rss",         "color": "#0a3d62", "es_rss": True},
+    {"id": "calciomer",  "nombre": "Calciomercato",    "url": "https://www.calciomercato.com/rss",               "color": "#c8102e", "es_rss": True},
 ]
 
 TODAS_FUENTES = FUENTES_NAC + FUENTES_INT
@@ -358,6 +364,20 @@ def prompt_parte_editorial(agenda: list) -> str:
 Por cada ítem, en UNA sola línea, decime por qué le importa a un lector argentino y un ángulo concreto para la nota. Telegráfico, español rioplatense, sin relleno.
 
 {lineas}"""
+
+def prompt_brief_item(item: dict) -> str:
+    fuentes_ctx = ""
+    if item.get("noticias"):
+        fuentes_ctx = "\nCómo lo titularon otros medios:\n" + "\n".join(
+            f'  • [{n["fuente"]["nombre"]}] {n["noticia"]["titulo"]}'
+            for n in item["noticias"][:6]
+        )
+    return f"""Sos editor jefe de Olé. Para este tema, dame un mini-brief en 3 líneas, español rioplatense, telegráfico y sin relleno:
+VALOR: por qué es noticia de verdad (no cuántos medios lo tienen, sino qué está en juego).
+ÁNGULO: el enfoque puntual para el lector de Olé (hincha argentino).
+TÍTULO: un título sugerido, filoso, de una línea.
+
+TEMA: {item["titulo"]}{fuentes_ctx}"""
 
 AGENDA_COLORES = {
     "SUBIR YA": "#c0392b", "REDACTAR": "#d68910",
@@ -754,12 +774,113 @@ def _extraer_as(html: str, fuente: dict) -> list:
     return noticias[:MAX_ITEMS]
 
 
+def _extraer_espn(html: str, fuente: dict) -> list:
+    """Scraper dedicado para ESPN AR (SPA React). El HTML estático trae JSON-LD
+    con las URLs reales; las notas siguen el patrón /_/id/NNNNNN/."""
+    noticias, seen = [], set()
+    soup = BeautifulSoup(html, "html.parser")
+    BASE = "https://www.espn.com.ar"
+    ESPN_SKIP = ["/autor/", "/author/", "/tag/", "/tags/", "/equipo/", "/liga/",
+                 "/atletismo/", "javascript:", "mailto:", "#", "/video/"]
+
+    def resolve_espn(href):
+        if not href:
+            return None
+        if any(s in href for s in ESPN_SKIP):
+            return None
+        if href.startswith("//"):
+            return "https:" + href
+        if href.startswith("/"):
+            return BASE + href
+        if href.startswith("http"):
+            return href
+        return None
+
+    def es_url_nota(url):
+        if not url:
+            return False
+        return "/_/id/" in url or "/nota/" in url or "/historia/" in url or "/story/" in url
+
+    urls_json = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+
+            def _walk(obj):
+                if isinstance(obj, dict):
+                    if obj.get("@type") in ("NewsArticle", "Article", "WebPage"):
+                        u = obj.get("url") or obj.get("mainEntityOfPage", {}).get("@id", "")
+                        if u and es_url_nota(u) and u not in urls_json:
+                            urls_json.append(u)
+                    if obj.get("@type") == "ItemList":
+                        for item in obj.get("itemListElement", []):
+                            u = item.get("url") or item.get("item", {}).get("url", "")
+                            if u and es_url_nota(u) and u not in urls_json:
+                                urls_json.append(u)
+                    for v in obj.values():
+                        _walk(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        _walk(v)
+            _walk(data)
+        except Exception:
+            pass
+
+    urls_html = []
+    for a in soup.find_all("a", href=True):
+        url = resolve_espn(a.get("href", ""))
+        if url and es_url_nota(url) and url not in urls_html:
+            urls_html.append(url)
+
+    todas_urls = list(dict.fromkeys(urls_json + urls_html))
+
+    url_to_titulo = {}
+    TITLE_SELS_ESPN = ["h1", "h2", "h3", "h4",
+                       "[class*=title]", "[class*=Title]",
+                       "[class*=headline]", "[class*=Headline]",
+                       "[class*=contentItem__title]"]
+    for a in soup.find_all("a", href=True):
+        url = resolve_espn(a.get("href", ""))
+        if not url or not es_url_nota(url):
+            continue
+        titulo = None
+        for sel in TITLE_SELS_ESPN:
+            t_el = a.select_one(sel)
+            if t_el:
+                titulo = t_el.get_text(strip=True)
+                break
+        if not titulo:
+            titulo = a.get_text(strip=True)
+        titulo = " ".join(titulo.split())
+        if 20 <= len(titulo) <= 300 and url not in url_to_titulo:
+            url_to_titulo[url] = titulo
+
+    for url in todas_urls:
+        if len(noticias) >= MAX_ITEMS:
+            break
+        titulo = url_to_titulo.get(url)
+        if not titulo:
+            slug = url.rstrip("/").split("/")[-1]
+            slug = re.sub(r"^\d+-", "", slug)
+            titulo = slug.replace("-", " ").title()
+            if len(titulo) < 15:
+                continue
+        if titulo in seen:
+            continue
+        seen.add(titulo)
+        noticias.append({"titulo": titulo, "url": url, "imagen": ""})
+
+    return noticias[:MAX_ITEMS]
+
+
 def extraer_generico(html: str, fuente: dict) -> list:
     # Scrapers específicos
     if fuente.get("es_ole"):
         return _extraer_ole(html, fuente)
     if fuente.get("es_as"):
         return _extraer_as(html, fuente)
+    if fuente.get("es_espn"):
+        return _extraer_espn(html, fuente)
 
     if fuente.get("es_rss"):
         return extraer_rss(html)
@@ -1374,6 +1495,8 @@ if "prev_tendencias" not in st.session_state:
     st.session_state.prev_tendencias = []
 if "agenda_parte" not in st.session_state:
     st.session_state.agenda_parte = ""
+if "agenda_briefs" not in st.session_state:
+    st.session_state.agenda_briefs = {}
 if "nota_rapida" not in st.session_state:
     st.session_state.nota_rapida = ""
 if "nota_rapida_titulares" not in st.session_state:
@@ -1807,19 +1930,38 @@ with tab_agenda:
             </div>
             """, unsafe_allow_html=True)
 
-            en_canasta = any(
-                item["noticia"]["titulo"] == it["titulo"] for item in st.session_state.canasta
-            )
-            if st.button(
-                "✅ En canasta" if en_canasta else "🧺 Mandar a canasta para redactar",
-                key=f"agenda_canasta_{it['accion']}_{hash(it['titulo'])}",
-                use_container_width=True, disabled=en_canasta,
-            ):
-                fuente_rep = (it["noticias"][0]["fuente"]
-                              if it.get("noticias") else
-                              {"id": "agenda", "nombre": "Agenda", "color": color})
-                _canasta_agregar(it["titulo"], it.get("url"), fuente_rep)
-                st.rerun()
+            brief_key = str(hash(it["titulo"]))
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                if st.button("✦ Brief IA", key=f"agenda_brief_{it['accion']}_{brief_key}",
+                             use_container_width=True):
+                    if not api_key:
+                        st.error("Ingresá tu API key")
+                    else:
+                        with st.spinner("Pensando el ángulo..."):
+                            try:
+                                st.session_state.agenda_briefs[brief_key] = call_claude(
+                                    prompt_brief_item(it), api_key, 400
+                                )
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+            with col_b2:
+                en_canasta = any(
+                    item["noticia"]["titulo"] == it["titulo"] for item in st.session_state.canasta
+                )
+                if st.button(
+                    "✅ En canasta" if en_canasta else "🧺 A canasta",
+                    key=f"agenda_canasta_{it['accion']}_{brief_key}",
+                    use_container_width=True, disabled=en_canasta,
+                ):
+                    fuente_rep = (it["noticias"][0]["fuente"]
+                                  if it.get("noticias") else
+                                  {"id": "agenda", "nombre": "Agenda", "color": color})
+                    _canasta_agregar(it["titulo"], it.get("url"), fuente_rep)
+                    st.rerun()
+
+            if st.session_state.agenda_briefs.get(brief_key):
+                st.info(st.session_state.agenda_briefs[brief_key])
 
 # ─── TAB NACIONALES ──────────────────────────────────────────────────────────
 with tab_nac:
